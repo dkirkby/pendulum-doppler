@@ -51,9 +51,9 @@
 * Macros
 ********************************************************************************/
 /* Define how many samples in a frame */
-#define FRAME_SIZE                  (4096)
-/* Process audio every Nth frame (~4 frames/sec at 16kHz/4096) */
-#define PROCESS_EVERY_NTH           4u
+#define FRAME_SIZE                  (2048)
+/* Process every Nth frame (1 = every frame; ~7.8 Hz update rate at 16kHz/2048) */
+#define PROCESS_EVERY_NTH           1u
 /* Desired sample rate. Typical values: 8/16/22.05/32/44.1/48kHz */
 #define SAMPLE_RATE_HZ              16000u
 /* Empirical correction for actual PDM sample rate (calibrate with known tone) */
@@ -101,6 +101,9 @@ volatile bool pdm_pcm_flag = true;
 
 /* Frame counter for rate limiting */
 uint32_t frame_count = 0;
+
+/* Elapsed time in ms; incremented by one frame period each time a frame is processed */
+uint32_t elapsed_ms = 0;
 
 /* PSD output buffer */
 float psd[PSD_SIZE];
@@ -189,7 +192,7 @@ int main(void)
     /* \x1b[2J\x1b[;H - ANSI ESC sequence for clear screen */
     printf("\x1b[2J\x1b[;H");
 
-    printf("PDM/PCM PSD Analyzer\r\n\n");
+    printf("Pendulum Doppler Analyzer\r\n\n");
 
     /* Run self-tests with synthetic tones */
     self_test(audio_frame, psd, 220.0f);
@@ -197,6 +200,9 @@ int main(void)
     self_test(audio_frame, psd, 880.0f);
     self_test(audio_frame, psd, 1000.0f);
     printf("\r\n");
+
+    /* CSV header for data logging (ax_g,ay_g,az_g columns will be added with IMU) */
+    printf("t_ms,freq_hz,snr_db,power_db\r\n");
 
     for(;;)
     {
@@ -212,11 +218,11 @@ int main(void)
                 frame_count = 0;
 
                 compute_psd(audio_frame, psd);
-                display_psd(psd);
                 float snr, peak_db;
                 float peak_freq = find_peak_frequency(psd, &snr, &peak_db);
-                printf("Peak frequency: %.1f Hz (SNR: %.1f dB, Power: %.1f dB)\r\n",
-                    peak_freq, snr, peak_db);
+                printf("%lu,%.2f,%.1f,%.1f\r\n",
+                    (unsigned long)elapsed_ms, peak_freq, snr, peak_db);
+                elapsed_ms += FRAME_SIZE * 1000u / SAMPLE_RATE_HZ;
             }
 
             /* Setup to read the next frame */

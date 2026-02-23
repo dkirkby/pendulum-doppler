@@ -10,6 +10,9 @@
 # ModusToolbox library repos or information about library dependencies
 libs/
 
+# BSP generated API reference docs (not needed for building)
+bsps/*/docs/
+
 # Eclipse IDE for ModusToolbox files
 .metadata/
 # .cyignore
