@@ -43,8 +43,10 @@
 #include "cyhal.h"
 #include "cybsp.h"
 #include "cy_retarget_io.h"
+#include "bmi270.h"
 
 #include "stdlib.h"
+#include "string.h"
 #include "math.h"
 
 /*******************************************************************************
@@ -80,6 +82,12 @@
 #define MAX_BAR_WIDTH               ((DB_MAX - DB_MIN) / DB_PER_CHAR)
 /* Half-width of the exclusion window (in bins) around the peak for SNR */
 #define SNR_EXCLUSION_HALFWIDTH     10u
+/* IMU accelerometer full-scale range in g (must match BMI2_ACC_RANGE_4G) */
+#define IMU_ACC_RANGE_G             4u
+/* LSB per g for the chosen range (= 32768 / IMU_ACC_RANGE_G) */
+#define IMU_ACC_LSB_PER_G           (32768.0f / (float)IMU_ACC_RANGE_G)
+/* Timer period in µs for the one-shot midpoint timer (64 ms at 1 MHz tick) */
+#define IMU_MIDPOINT_COUNTS         63999u
 
 /*******************************************************************************
 * Function Prototypes
@@ -91,6 +99,12 @@ void compute_psd(const int16_t *samples, float *psd_out);
 void display_psd(const float *psd);
 float find_peak_frequency(const float *psd, float *snr_out, float *peak_db_out);
 void self_test(int16_t *buf, float *psd_buf, float test_freq);
+void imu_init(void);
+void imu_self_test(void);
+void midpoint_timer_isr(void *arg, cyhal_timer_event_t event);
+BMI2_INTF_RETURN_TYPE bmi2_i2c_read(uint8_t reg_addr, uint8_t *data, uint32_t len, void *intf_ptr);
+BMI2_INTF_RETURN_TYPE bmi2_i2c_write(uint8_t reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr);
+void bmi2_delay_us(uint32_t period, void *intf_ptr);
 
 /*******************************************************************************
 * Global Variables
@@ -104,6 +118,22 @@ uint32_t frame_count = 0;
 
 /* Elapsed time in ms; incremented by one frame period each time a frame is processed */
 uint32_t elapsed_ms = 0;
+
+/* IMU HAL Objects */
+cyhal_i2c_t       imu_i2c;
+struct bmi2_dev   imu_dev;
+cyhal_timer_t     imu_timer;
+
+/* BMI270 I2C device address (passed as intf_ptr to SensorAPI callbacks) */
+static uint8_t    imu_dev_addr = BMI2_I2C_PRIM_ADDR;
+
+/* Most recent accelerometer reading (set by main loop after midpoint timer fires) */
+struct bmi2_sens_data imu_midpoint;
+
+/* imu_pending: set by timer ISR; cleared by main loop after IMU read completes */
+volatile bool imu_pending = false;
+/* imu_ready: set after the first successful IMU read; guards CSV output */
+volatile bool imu_ready   = false;
 
 /* PSD output buffer */
 float psd[PSD_SIZE];
@@ -172,6 +202,9 @@ int main(void)
     /* Init the clocks */
     clock_init();
 
+    /* Initialize the IMU (I2C bus, BMI270, midpoint timer) */
+    imu_init();
+
     /* Initialize retarget-io to use the debug UART port */
     cy_retarget_io_init(CYBSP_DEBUG_UART_TX, CYBSP_DEBUG_UART_RX, CY_RETARGET_IO_BAUDRATE);
 
@@ -199,13 +232,23 @@ int main(void)
     self_test(audio_frame, psd, 440.0f);
     self_test(audio_frame, psd, 880.0f);
     self_test(audio_frame, psd, 1000.0f);
+    imu_self_test();
     printf("\r\n");
 
-    /* CSV header for data logging (ax_g,ay_g,az_g columns will be added with IMU) */
-    printf("t_ms,freq_hz,snr_db,power_db\r\n");
+    /* CSV header for data logging */
+    printf("t_ms,freq_hz,snr_db,power_db,ax_g,ay_g,az_g\r\n");
 
     for(;;)
     {
+        /* When the midpoint timer fires, read the IMU from main context
+         * (blocking I2C must not be called from an ISR) */
+        if (imu_pending)
+        {
+            imu_pending = false;
+            bmi2_get_sensor_data(&imu_midpoint, &imu_dev);
+            imu_ready = true;
+        }
+
         /* Check if a microphone frame is ready */
         if (pdm_pcm_flag)
         {
@@ -220,13 +263,22 @@ int main(void)
                 compute_psd(audio_frame, psd);
                 float snr, peak_db;
                 float peak_freq = find_peak_frequency(psd, &snr, &peak_db);
-                printf("%lu,%.2f,%.1f,%.1f\r\n",
-                    (unsigned long)elapsed_ms, peak_freq, snr, peak_db);
+
+                if (imu_ready)
+                {
+                    float ax = (float)imu_midpoint.acc.x / IMU_ACC_LSB_PER_G;
+                    float ay = (float)imu_midpoint.acc.y / IMU_ACC_LSB_PER_G;
+                    float az = (float)imu_midpoint.acc.z / IMU_ACC_LSB_PER_G;
+                    printf("%lu,%.2f,%.1f,%.1f,%.4f,%.4f,%.4f\r\n",
+                        (unsigned long)elapsed_ms, peak_freq, snr, peak_db, ax, ay, az);
+                }
                 elapsed_ms += FRAME_SIZE * 1000u / SAMPLE_RATE_HZ;
             }
 
-            /* Setup to read the next frame */
+            /* Setup to read the next frame and arm the midpoint timer */
             cyhal_pdm_pcm_read_async(&pdm_pcm, audio_frame, FRAME_SIZE);
+            cyhal_timer_reset(&imu_timer);
+            cyhal_timer_start(&imu_timer);
         }
 
         /* Handle User Button press */
@@ -641,6 +693,142 @@ void clock_init(void)
 
     /* Apply empirical correction to nominal sample rate */
     actual_sample_rate = (float)SAMPLE_RATE_HZ * SAMPLE_RATE_CORRECTION;
+}
+
+/*******************************************************************************
+* Function Name: midpoint_timer_isr
+********************************************************************************
+* Summary:
+*  One-shot timer ISR fired at the frame midpoint (64 ms after DMA start).
+*  Sets the imu_pending flag so the main loop performs the actual I2C read.
+*  Blocking HAL calls must not be made from an ISR context.
+*
+*******************************************************************************/
+void midpoint_timer_isr(void *arg, cyhal_timer_event_t event)
+{
+    (void)arg;
+    (void)event;
+    imu_pending = true;
+}
+
+/*******************************************************************************
+* Function Names: bmi2_i2c_read / bmi2_i2c_write / bmi2_delay_us
+********************************************************************************
+* Summary:
+*  Platform callbacks required by the Bosch BMI270 SensorAPI.
+*  bmi2_i2c_read / bmi2_i2c_write wrap the PSoC 6 cyhal_i2c HAL calls.
+*  bmi2_delay_us wraps cyhal_system_delay_us.
+*
+*******************************************************************************/
+BMI2_INTF_RETURN_TYPE bmi2_i2c_read(uint8_t reg_addr, uint8_t *data,
+                                     uint32_t len, void *intf_ptr)
+{
+    uint8_t dev_addr = *(const uint8_t *)intf_ptr;
+    cy_rslt_t r;
+    r = cyhal_i2c_master_write(&imu_i2c, dev_addr, &reg_addr, 1, 10, false);
+    if (r != CY_RSLT_SUCCESS) { return BMI2_E_COM_FAIL; }
+    r = cyhal_i2c_master_read(&imu_i2c, dev_addr, data, (uint16_t)len, 10, true);
+    return (r == CY_RSLT_SUCCESS) ? BMI2_OK : BMI2_E_COM_FAIL;
+}
+
+BMI2_INTF_RETURN_TYPE bmi2_i2c_write(uint8_t reg_addr, const uint8_t *data,
+                                      uint32_t len, void *intf_ptr)
+{
+    /* Maximum SensorAPI burst is read_write_len (32) bytes + 1 register byte */
+    uint8_t buf[33];
+    if (len > 32u) { return BMI2_E_COM_FAIL; }
+    buf[0] = reg_addr;
+    memcpy(buf + 1, data, len);
+    uint8_t dev_addr = *(const uint8_t *)intf_ptr;
+    cy_rslt_t r = cyhal_i2c_master_write(&imu_i2c, dev_addr, buf,
+                                          (uint16_t)(len + 1u), 10, true);
+    return (r == CY_RSLT_SUCCESS) ? BMI2_OK : BMI2_E_COM_FAIL;
+}
+
+void bmi2_delay_us(uint32_t period, void *intf_ptr)
+{
+    (void)intf_ptr;
+    cyhal_system_delay_us(period);
+}
+
+/*******************************************************************************
+* Function Name: imu_init
+********************************************************************************
+* Summary:
+*  Initialize the I2C bus, BMI270 sensor via the Bosch SensorAPI, and the
+*  one-shot midpoint timer. Configures the accelerometer for 200 Hz, ±4 g,
+*  OSR4 performance mode. The gyroscope is disabled to reduce I2C traffic.
+*
+*******************************************************************************/
+void imu_init(void)
+{
+    /* --- I2C master at 400 kHz --- */
+    const cyhal_i2c_cfg_t i2c_cfg = {
+        .is_slave        = false,
+        .address         = 0,
+        .frequencyhal_hz = 400000u
+    };
+    cyhal_i2c_init(&imu_i2c, CYBSP_I2C_SDA, CYBSP_I2C_SCL, NULL);
+    cyhal_i2c_configure(&imu_i2c, &i2c_cfg);
+
+    /* --- BMI270 init via Bosch SensorAPI --- */
+    imu_dev.intf           = BMI2_I2C_INTF;
+    imu_dev.intf_ptr       = &imu_dev_addr;
+    imu_dev.read           = bmi2_i2c_read;
+    imu_dev.write          = bmi2_i2c_write;
+    imu_dev.delay_us       = bmi2_delay_us;
+    imu_dev.read_write_len = 32;
+    bmi270_init(&imu_dev);
+
+    /* Configure accelerometer: 200 Hz, ±4 g, OSR4, performance mode */
+    struct bmi2_sens_config acc_cfg;
+    acc_cfg.type = BMI2_ACCEL;
+    bmi2_get_sensor_config(&acc_cfg, 1, &imu_dev);
+    acc_cfg.cfg.acc.odr         = BMI2_ACC_ODR_200HZ;
+    acc_cfg.cfg.acc.range       = BMI2_ACC_RANGE_4G;
+    acc_cfg.cfg.acc.bwp         = BMI2_ACC_OSR4_AVG1;
+    acc_cfg.cfg.acc.filter_perf = BMI2_PERF_OPT_MODE;
+    bmi2_set_sensor_config(&acc_cfg, 1, &imu_dev);
+
+    /* Enable accelerometer only (gyro stays off) */
+    uint8_t sens_list = BMI2_ACCEL;
+    bmi2_sensor_enable(&sens_list, 1, &imu_dev);
+
+    /* --- One-shot timer: fires 64 ms after each frame starts --- */
+    const cyhal_timer_cfg_t timer_cfg = {
+        .compare_value = 0,
+        .period        = IMU_MIDPOINT_COUNTS,
+        .direction     = CYHAL_TIMER_DIR_UP,
+        .is_compare    = false,
+        .is_continuous = false,
+        .value         = 0
+    };
+    cyhal_timer_init(&imu_timer, NC, NULL);
+    cyhal_timer_configure(&imu_timer, &timer_cfg);
+    cyhal_timer_set_frequency(&imu_timer, 1000000u);
+    cyhal_timer_register_callback(&imu_timer, midpoint_timer_isr, NULL);
+    cyhal_timer_enable_event(&imu_timer, CYHAL_TIMER_IRQ_TERMINAL_COUNT,
+                             CYHAL_ISR_PRIORITY_DEFAULT, true);
+}
+
+/*******************************************************************************
+* Function Name: imu_self_test
+********************************************************************************
+* Summary:
+*  Read a single accelerometer sample while the board is stationary and flat.
+*  Prints ax/ay/az in g; the expected result is |az| ≈ 1 g, |ax|,|ay| < 0.2 g.
+*
+*******************************************************************************/
+void imu_self_test(void)
+{
+    struct bmi2_sens_data d;
+    cyhal_system_delay_ms(10);   /* let the sensor settle after init */
+    bmi2_get_sensor_data(&d, &imu_dev);
+    float ax = (float)d.acc.x / IMU_ACC_LSB_PER_G;
+    float ay = (float)d.acc.y / IMU_ACC_LSB_PER_G;
+    float az = (float)d.acc.z / IMU_ACC_LSB_PER_G;
+    printf("IMU self-test: ax=%.3f g, ay=%.3f g, az=%.3f g  (expect |az|~1, |ax|,|ay|<0.2)\r\n",
+           ax, ay, az);
 }
 
 /* [] END OF FILE */

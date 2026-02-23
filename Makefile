@@ -139,6 +139,9 @@ PREBUILD=
 # Custom post-build commands to run.
 POSTBUILD=
 
+# Exclude the Bosch SensorAPI desktop-platform example files (require coines.h)
+CY_IGNORE+=$(wildcard $(CY_GETLIBS_SHARED_PATH)$(CY_GETLIBS_SHARED_NAME)/BMI270_SensorAPI/v2.86.1/*_examples)
+
 
 ################################################################################
 # Paths
