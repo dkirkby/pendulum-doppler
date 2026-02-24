@@ -28,10 +28,12 @@ roughly 0.6 %, or ~18 Hz for a 3 kHz source — well within the resolution of th
 |---------|--------|
 | Audio capture | PDM microphone → 16 kHz, 16-bit PCM via DMA |
 | Spectrum analysis | 2048-point Hann-windowed radix-2 FFT → one-sided PSD |
-| Peak detection | Parabolic interpolation on dB-scale bins (sub-bin accuracy) |
+| Peak detection | Parabolic interpolation on dB-scale bins (sub-bin accuracy, 0.01 Hz resolution) |
 | SNR | Peak power vs. mean noise power outside a ±10-bin exclusion window |
 | IMU | BMI270 accelerometer read at the midpoint of each audio frame via I2C |
-| Data output | CSV over UART: timestamp, peak frequency, SNR, power, ax, ay, az |
+| Data storage | Up to 500 records stored in SRAM during battery-powered operation |
+| Timestamps | Hardware-accurate via Cortex-M4 DWT cycle counter (includes inter-frame dead time) |
+| Data output | CSV dumped over UART on demand after recording stops |
 | Self-test | Synthetic sine waves at 220 / 440 / 880 / 1000 Hz + IMU level check on startup |
 
 ## Hardware
@@ -135,45 +137,82 @@ make program CONFIG=Release    # optimised build
 make clean                     # remove build artefacts
 ```
 
-## Viewing and recording data
+## Running an experiment
 
-Open a serial terminal at **115200 baud, 8N1** on the KitProg3 COM port.
+The firmware is designed for **battery-powered operation**: data is stored in SRAM during the
+experiment and downloaded over USB afterwards.
+Up to 500 records can be stored (≈ 64 s at 7.8 frames/s).
 
-On startup the firmware prints four audio self-test lines followed by an IMU level check:
-```
-Self-test: generated 220.0 Hz, measured 220.0 Hz, error 0.00 Hz, SNR 57.4 dB, Power 44.0 dB
-Self-test: generated 440.0 Hz, measured 440.0 Hz, error 0.00 Hz, SNR 57.4 dB, Power 44.0 dB
-Self-test: generated 880.0 Hz, measured 880.0 Hz, error 0.00 Hz, SNR 57.4 dB, Power 44.0 dB
-Self-test: generated 1000.0 Hz, measured 1000.0 Hz, error 0.00 Hz, SNR 57.4 dB, Power 44.0 dB
-IMU self-test: ax=0.012 g, ay=-0.008 g, az=0.998 g  (expect |az|~1, |ax|,|ay|<0.2)
-```
+### LED and button states
 
-Then, approximately 8 times per second, one CSV line is printed per processed audio frame:
+| State | Green LED | Meaning |
+|-------|-----------|---------|
+| IDLE | Off | Waiting for button press |
+| SETTLING | 2 Hz blink | 3 s stabilisation delay after button press |
+| RECORDING | ~4 Hz blink | Capturing and storing data |
+| DONE | Off | Recording stopped; command interface active |
+
+### Step-by-step workflow
+
+1. **Power the board** from battery (or USB — either works).
+   On startup the firmware runs audio and IMU self-tests and prints results over UART,
+   then prints `Press button to start recording.`
+
+2. **Set up the pendulum** and start the sound source.
+
+3. **Press the USER button** once.
+   The LED blinks at 2 Hz for 3 seconds (`Settling for 3 s...`) to let any mechanical
+   disturbance from the button press damp out before data collection begins.
+
+4. **Release the pendulum.** After 3 s the LED switches to a faster ~4 Hz blink
+   (`Recording started.`) — data is now being stored in SRAM.
+
+5. **Press the USER button** again to stop recording.
+   The LED turns off and the firmware enters command mode (`Recording complete: N records (X.X s)`).
+
+6. **Connect the USB cable** (if not already connected) and open a serial terminal at
+   **115200 baud** on the KitProg3 COM port.
+
+7. **Type `d`** (no Enter needed) to dump all stored records as CSV:
+
 ```
 t_ms,freq_hz,snr_db,power_db,ax_g,ay_g,az_g
-0,3001.2,28.4,42.1,0.0123,-0.0081,0.9984
-128,3001.5,27.9,41.8,0.1042,-0.0076,0.9945
-256,3004.1,26.3,41.2,0.3817,-0.0082,0.9247
+132,3001.25,28.4,42.1,0.0123,-0.0081,0.9984
+261,3001.47,27.9,41.8,0.1042,-0.0076,0.9945
+391,3004.13,26.3,41.2,0.3817,-0.0082,0.9247
 ...
+# 47 records
 ```
 
-To save a run to a file, redirect the serial port output:
+   You can type `d` multiple times to capture the output again if needed.
 
-**macOS / Linux**
-```bash
-# List available ports first
-ls /dev/tty.*          # macOS
-ls /dev/ttyACM*        # Linux
+8. **Press the USER button** to start a new 3 s settling phase and then a fresh recording.
+   The buffer is cleared automatically.
 
-# Record to a file (Ctrl-C to stop)
-cat /dev/tty.usbmodem1234 > run1.csv
+### CSV column reference
+
+| Column | Units | Notes |
+|--------|-------|-------|
+| `t_ms` | ms | Time since recording started; hardware-timed via DWT cycle counter |
+| `freq_hz` | Hz | Peak frequency, 0.01 Hz resolution (parabolic interpolation) |
+| `snr_db` | dB | Peak power relative to mean noise floor (±10-bin exclusion window) |
+| `power_db` | dB | Absolute peak power |
+| `ax_g`, `ay_g`, `az_g` | g | BMI270 accelerometer, sampled at frame midpoint |
+
+### On startup
+
+The firmware prints self-test results before entering IDLE:
+
 ```
+Pendulum Doppler Analyzer
 
-**Windows (PowerShell)**
-```powershell
-# Find the COM port in Device Manager, then:
-& "C:\Windows\System32\mode.com" COM3: BAUD=115200 PARITY=n DATA=8 STOP=1
-Get-Content \\.\COM3 | Out-File run1.csv
+Self-test: generated 220.0 Hz, measured 220.1 Hz, error 0.09 Hz, SNR 82.2 dB, Power 108.0 dB
+Self-test: generated 440.0 Hz, measured 440.1 Hz, error 0.12 Hz, SNR 77.8 dB, Power 107.6 dB
+Self-test: generated 880.0 Hz, measured 879.9 Hz, error -0.11 Hz, SNR 81.2 dB, Power 107.4 dB
+Self-test: generated 1000.0 Hz, measured 1000.0 Hz, error 0.00 Hz, SNR 116.4 dB, Power 108.2 dB
+IMU self-test: ax=-0.003 g, ay=-0.014 g, az=1.000 g  (expect |az|~1, |ax|,|ay|<0.2)
+
+Press button to start recording.
 ```
 
 ## Project structure

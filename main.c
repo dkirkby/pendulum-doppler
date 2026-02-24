@@ -97,7 +97,7 @@
 /* Compact record stored in SRAM during an experiment (16 bytes, packed) */
 typedef struct {
     uint32_t t_ms;       /* elapsed time in ms since recording started        */
-    uint16_t freq_x10;   /* peak frequency × 10 (0.1 Hz LSB; max 6553.5 Hz)  */
+    uint32_t freq_x100;  /* peak frequency × 100 (0.01 Hz LSB; max 42949672 Hz) */
     int16_t  snr_x10;    /* SNR × 10 (0.1 dB LSB)                            */
     int16_t  power_x10;  /* peak power × 10 (0.1 dB LSB)                     */
     int16_t  acc_x;      /* raw IMU x counts (same scale as bmi2_sens_data)   */
@@ -106,7 +106,7 @@ typedef struct {
 } __attribute__((packed)) ExptRecord_t;
 
 /* Application state machine */
-typedef enum { STATE_IDLE, STATE_RECORDING, STATE_DONE } AppState;
+typedef enum { STATE_IDLE, STATE_SETTLING, STATE_RECORDING, STATE_DONE } AppState;
 
 /*******************************************************************************
 * Function Prototypes
@@ -172,6 +172,10 @@ static AppState     app_state    = STATE_IDLE;
  * Unsigned subtraction handles the 28.6 s rollover correctly provided
  * successive calls are always < 2^32 cycles apart (~130 ms here). */
 static uint32_t dwt_last_cyccnt = 0;
+
+/* DWT snapshots for the settling phase (3 s delay after button press) */
+static uint32_t settling_start_cyccnt = 0;
+static uint32_t settling_led_cyccnt   = 0;
 
 /* Audio sample buffer — global so run_cmd_mode() can restart the PDM DMA */
 static int16_t audio_frame[FRAME_SIZE];
@@ -315,6 +319,24 @@ int main(void)
                         app_state = STATE_DONE;
                     }
                 }
+                else if (app_state == STATE_SETTLING)
+                {
+                    /* 2 Hz LED blink: toggle every 250 ms (SystemCoreClock/4 cycles) */
+                    if ((now_cyc - settling_led_cyccnt) >= (SystemCoreClock / 4u))
+                    {
+                        cyhal_gpio_toggle(CYBSP_USER_LED);
+                        settling_led_cyccnt = now_cyc;
+                    }
+                    /* After 3 s, begin recording (elapsed_ms reset here) */
+                    if ((now_cyc - settling_start_cyccnt) >= (SystemCoreClock * 3u))
+                    {
+                        elapsed_ms = 0;
+                        /* dwt_last_cyccnt was just set to now_cyc above */
+                        cyhal_gpio_write(CYBSP_USER_LED, CYBSP_LED_STATE_OFF);
+                        app_state = STATE_RECORDING;
+                        printf("Recording started.\r\n");
+                    }
+                }
             }
 
             /* Setup to read the next frame and arm the midpoint timer */
@@ -329,12 +351,13 @@ int main(void)
             button_flag = false;
             if (app_state == STATE_IDLE)
             {
-                record_count    = 0;
-                elapsed_ms      = 0;
-                dwt_last_cyccnt = DWT->CYCCNT;
-                imu_ready       = false;
-                app_state       = STATE_RECORDING;
-                printf("Starting new recording.\r\n");
+                record_count          = 0;
+                imu_ready             = false;
+                settling_start_cyccnt = DWT->CYCCNT;
+                settling_led_cyccnt   = DWT->CYCCNT;
+                cyhal_gpio_write(CYBSP_USER_LED, CYBSP_LED_STATE_OFF);
+                app_state             = STATE_SETTLING;
+                printf("Settling for 3 s...\r\n");
             }
             else if (app_state == STATE_RECORDING)
             {
@@ -912,7 +935,7 @@ void store_record(float peak_freq, float snr, float peak_db)
 
     ExptRecord_t *r = &record_buffer[record_count];
     r->t_ms      = elapsed_ms;
-    r->freq_x10  = (uint16_t)(peak_freq * 10.0f + 0.5f);
+    r->freq_x100 = (uint32_t)(peak_freq * 100.0f + 0.5f);
     r->snr_x10   = (int16_t)(snr   * 10.0f);
     r->power_x10 = (int16_t)(peak_db * 10.0f);
     r->acc_x     = imu_midpoint.acc.x;
@@ -938,9 +961,9 @@ void dump_csv(void)
         float ax = (float)r->acc_x / IMU_ACC_LSB_PER_G;
         float ay = (float)r->acc_y / IMU_ACC_LSB_PER_G;
         float az = (float)r->acc_z / IMU_ACC_LSB_PER_G;
-        printf("%lu,%.1f,%.1f,%.1f,%.4f,%.4f,%.4f\r\n",
+        printf("%lu,%.2f,%.1f,%.1f,%.4f,%.4f,%.4f\r\n",
                (unsigned long)r->t_ms,
-               r->freq_x10  / 10.0f,
+               r->freq_x100 / 100.0f,
                r->snr_x10   / 10.0f,
                r->power_x10 / 10.0f,
                ax, ay, az);
@@ -984,19 +1007,20 @@ void run_cmd_mode(void)
         {
             if (button_flag)
             {
-                button_flag     = false;
-                record_count    = 0;
-                elapsed_ms      = 0;
-                dwt_last_cyccnt = DWT->CYCCNT;
-                imu_ready       = false;
+                button_flag = false;
+                record_count = 0;
+                imu_ready    = false;
                 /* Restart the PDM DMA and midpoint timer so the main loop
                  * receives a frame interrupt and doesn't sleep forever. */
                 pdm_pcm_flag = false;
                 cyhal_pdm_pcm_read_async(&pdm_pcm, audio_frame, FRAME_SIZE);
                 cyhal_timer_reset(&imu_timer);
                 cyhal_timer_start(&imu_timer);
-                app_state = STATE_RECORDING;
-                printf("\r\nStarting new recording.\r\n");
+                settling_start_cyccnt = DWT->CYCCNT;
+                settling_led_cyccnt   = DWT->CYCCNT;
+                cyhal_gpio_write(CYBSP_USER_LED, CYBSP_LED_STATE_OFF);
+                app_state = STATE_SETTLING;
+                printf("\r\nSettling for 3 s...\r\n");
                 return;
             }
             rc = cyhal_uart_getc(&cy_retarget_io_uart_obj, &ch, 20);
