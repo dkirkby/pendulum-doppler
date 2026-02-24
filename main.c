@@ -88,6 +88,25 @@
 #define IMU_ACC_LSB_PER_G           (32768.0f / (float)IMU_ACC_RANGE_G)
 /* Timer period in µs for the one-shot midpoint timer (64 ms at 1 MHz tick) */
 #define IMU_MIDPOINT_COUNTS         63999u
+/* Maximum number of data records stored in SRAM (500 × 16 B = 8 KB; covers ~64 s) */
+#define MAX_RECORDS                 500u
+
+/*******************************************************************************
+* Data Types
+********************************************************************************/
+/* Compact record stored in SRAM during an experiment (16 bytes, packed) */
+typedef struct {
+    uint32_t t_ms;       /* elapsed time in ms since recording started        */
+    uint16_t freq_x10;   /* peak frequency × 10 (0.1 Hz LSB; max 6553.5 Hz)  */
+    int16_t  snr_x10;    /* SNR × 10 (0.1 dB LSB)                            */
+    int16_t  power_x10;  /* peak power × 10 (0.1 dB LSB)                     */
+    int16_t  acc_x;      /* raw IMU x counts (same scale as bmi2_sens_data)   */
+    int16_t  acc_y;      /* raw IMU y counts                                  */
+    int16_t  acc_z;      /* raw IMU z counts                                  */
+} __attribute__((packed)) ExptRecord_t;
+
+/* Application state machine */
+typedef enum { STATE_IDLE, STATE_RECORDING, STATE_DONE } AppState;
 
 /*******************************************************************************
 * Function Prototypes
@@ -105,6 +124,9 @@ void midpoint_timer_isr(void *arg, cyhal_timer_event_t event);
 BMI2_INTF_RETURN_TYPE bmi2_i2c_read(uint8_t reg_addr, uint8_t *data, uint32_t len, void *intf_ptr);
 BMI2_INTF_RETURN_TYPE bmi2_i2c_write(uint8_t reg_addr, const uint8_t *data, uint32_t len, void *intf_ptr);
 void bmi2_delay_us(uint32_t period, void *intf_ptr);
+void store_record(float peak_freq, float snr, float peak_db);
+void dump_csv(void);
+void run_cmd_mode(void);
 
 /*******************************************************************************
 * Global Variables
@@ -140,6 +162,19 @@ float psd[PSD_SIZE];
 
 /* Actual sample rate (corrected from hardware clock readback) */
 float actual_sample_rate;
+
+/* Experiment data store */
+static ExptRecord_t record_buffer[MAX_RECORDS];
+static uint32_t     record_count = 0;
+static AppState     app_state    = STATE_IDLE;
+
+/* DWT cycle-counter snapshot taken at the start of each processed frame.
+ * Unsigned subtraction handles the 28.6 s rollover correctly provided
+ * successive calls are always < 2^32 cycles apart (~130 ms here). */
+static uint32_t dwt_last_cyccnt = 0;
+
+/* Audio sample buffer — global so run_cmd_mode() can restart the PDM DMA */
+static int16_t audio_frame[FRAME_SIZE];
 
 /* HAL Object */
 cyhal_pdm_pcm_t pdm_pcm;
@@ -187,7 +222,6 @@ cyhal_gpio_callback_data_t cb_data =
 int main(void)
 {
     cy_rslt_t result;
-    int16_t  audio_frame[FRAME_SIZE] = {0};
 
     /* Initialize the device and board peripherals */
     result = cybsp_init() ;
@@ -199,6 +233,11 @@ int main(void)
     /* Enable global interrupts */
     __enable_irq();
 
+    /* Enable the Cortex-M4 DWT cycle counter for hardware timestamps */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+
     /* Init the clocks */
     clock_init();
 
@@ -208,7 +247,7 @@ int main(void)
     /* Initialize retarget-io to use the debug UART port */
     cy_retarget_io_init(CYBSP_DEBUG_UART_TX, CYBSP_DEBUG_UART_RX, CY_RETARGET_IO_BAUDRATE);
 
-    /* Initialize the User LED */
+    /* Initialize the User LED (green, active-low on this board) */
     cyhal_gpio_init(CYBSP_USER_LED, CYHAL_GPIO_DIR_OUTPUT, CYHAL_GPIO_DRIVE_STRONG, CYBSP_LED_STATE_OFF);
 
     /* Initialize the User Button */
@@ -233,10 +272,7 @@ int main(void)
     self_test(audio_frame, psd, 880.0f);
     self_test(audio_frame, psd, 1000.0f);
     imu_self_test();
-    printf("\r\n");
-
-    /* CSV header for data logging */
-    printf("t_ms,freq_hz,snr_db,power_db,ax_g,ay_g,az_g\r\n");
+    printf("\r\nPress button to start recording.\r\n");
 
     for(;;)
     {
@@ -264,15 +300,21 @@ int main(void)
                 float snr, peak_db;
                 float peak_freq = find_peak_frequency(psd, &snr, &peak_db);
 
-                if (imu_ready)
+                /* Measure actual inter-frame interval using the DWT cycle counter.
+                 * Unsigned subtraction is wrap-safe for intervals < 28.6 s. */
+                uint32_t now_cyc = DWT->CYCCNT;
+                elapsed_ms += (now_cyc - dwt_last_cyccnt) / (SystemCoreClock / 1000u);
+                dwt_last_cyccnt = now_cyc;
+
+                if (app_state == STATE_RECORDING && imu_ready)
                 {
-                    float ax = (float)imu_midpoint.acc.x / IMU_ACC_LSB_PER_G;
-                    float ay = (float)imu_midpoint.acc.y / IMU_ACC_LSB_PER_G;
-                    float az = (float)imu_midpoint.acc.z / IMU_ACC_LSB_PER_G;
-                    printf("%lu,%.2f,%.1f,%.1f,%.4f,%.4f,%.4f\r\n",
-                        (unsigned long)elapsed_ms, peak_freq, snr, peak_db, ax, ay, az);
+                    store_record(peak_freq, snr, peak_db);
+                    cyhal_gpio_toggle(CYBSP_USER_LED);
+                    if (record_count >= MAX_RECORDS)
+                    {
+                        app_state = STATE_DONE;
+                    }
                 }
-                elapsed_ms += FRAME_SIZE * 1000u / SAMPLE_RATE_HZ;
             }
 
             /* Setup to read the next frame and arm the midpoint timer */
@@ -281,10 +323,30 @@ int main(void)
             cyhal_timer_start(&imu_timer);
         }
 
-        /* Handle User Button press */
+        /* Handle button press: toggle between IDLE and RECORDING */
         if (button_flag)
         {
             button_flag = false;
+            if (app_state == STATE_IDLE)
+            {
+                record_count    = 0;
+                elapsed_ms      = 0;
+                dwt_last_cyccnt = DWT->CYCCNT;
+                imu_ready       = false;
+                app_state       = STATE_RECORDING;
+                printf("Starting new recording.\r\n");
+            }
+            else if (app_state == STATE_RECORDING)
+            {
+                app_state = STATE_DONE;
+            }
+        }
+
+        /* Enter command-line mode when recording stops (button or buffer full) */
+        if (app_state == STATE_DONE)
+        {
+            cyhal_gpio_write(CYBSP_USER_LED, CYBSP_LED_STATE_OFF);
+            run_cmd_mode();   /* blocks until user types 'reset' */
         }
 
         cyhal_syspm_sleep();
@@ -829,6 +891,128 @@ void imu_self_test(void)
     float az = (float)d.acc.z / IMU_ACC_LSB_PER_G;
     printf("IMU self-test: ax=%.3f g, ay=%.3f g, az=%.3f g  (expect |az|~1, |ax|,|ay|<0.2)\r\n",
            ax, ay, az);
+}
+
+/*******************************************************************************
+* Function Name: store_record
+********************************************************************************
+* Summary:
+*  Append one data record to the SRAM buffer using the current elapsed_ms
+*  timestamp and the most-recent IMU sample. Does nothing if the buffer is full.
+*
+* Parameters:
+*  peak_freq: peak frequency in Hz from find_peak_frequency()
+*  snr:       SNR in dB
+*  peak_db:   absolute peak power in dB
+*
+*******************************************************************************/
+void store_record(float peak_freq, float snr, float peak_db)
+{
+    if (record_count >= MAX_RECORDS) return;
+
+    ExptRecord_t *r = &record_buffer[record_count];
+    r->t_ms      = elapsed_ms;
+    r->freq_x10  = (uint16_t)(peak_freq * 10.0f + 0.5f);
+    r->snr_x10   = (int16_t)(snr   * 10.0f);
+    r->power_x10 = (int16_t)(peak_db * 10.0f);
+    r->acc_x     = imu_midpoint.acc.x;
+    r->acc_y     = imu_midpoint.acc.y;
+    r->acc_z     = imu_midpoint.acc.z;
+    record_count++;
+}
+
+/*******************************************************************************
+* Function Name: dump_csv
+********************************************************************************
+* Summary:
+*  Print all stored records as CSV over UART. Column names match the original
+*  live-output format so downstream scripts are unchanged.
+*
+*******************************************************************************/
+void dump_csv(void)
+{
+    printf("t_ms,freq_hz,snr_db,power_db,ax_g,ay_g,az_g\r\n");
+    for (uint32_t i = 0; i < record_count; i++)
+    {
+        const ExptRecord_t *r = &record_buffer[i];
+        float ax = (float)r->acc_x / IMU_ACC_LSB_PER_G;
+        float ay = (float)r->acc_y / IMU_ACC_LSB_PER_G;
+        float az = (float)r->acc_z / IMU_ACC_LSB_PER_G;
+        printf("%lu,%.1f,%.1f,%.1f,%.4f,%.4f,%.4f\r\n",
+               (unsigned long)r->t_ms,
+               r->freq_x10  / 10.0f,
+               r->snr_x10   / 10.0f,
+               r->power_x10 / 10.0f,
+               ax, ay, az);
+    }
+    printf("# %lu records\r\n", (unsigned long)record_count);
+}
+
+/*******************************************************************************
+* Function Name: run_cmd_mode
+********************************************************************************
+* Summary:
+*  Blocking single-character command interface entered after recording stops.
+*  Works with any serial terminal regardless of line-ending settings.
+*  Supported commands (single keypress, no Enter required):
+*    d - dump all stored records as CSV
+*    r - clear buffer and return to STATE_IDLE
+*
+*  Returns only after the 'r' command is issued.
+*
+*******************************************************************************/
+void run_cmd_mode(void)
+{
+    float duration_s = (float)record_count * (float)FRAME_SIZE / (float)SAMPLE_RATE_HZ;
+
+    printf("\r\nRecording complete: %lu records (%.1f s)\r\n",
+           (unsigned long)record_count, duration_s);
+    printf("Commands: d=dump  (button starts new recording)\r\n");
+
+    for (;;)
+    {
+        printf("> ");
+        fflush(stdout);
+
+        /* Poll for a UART byte using a short timeout so we can also respond
+         * to a button press without blocking indefinitely.
+         * cyhal_uart_getc with timeout > 0 returns an error code after that
+         * many ms if no byte arrives; button_flag is checked each time around. */
+        uint8_t ch = 0;
+        cy_rslt_t rc;
+        do
+        {
+            if (button_flag)
+            {
+                button_flag     = false;
+                record_count    = 0;
+                elapsed_ms      = 0;
+                dwt_last_cyccnt = DWT->CYCCNT;
+                imu_ready       = false;
+                /* Restart the PDM DMA and midpoint timer so the main loop
+                 * receives a frame interrupt and doesn't sleep forever. */
+                pdm_pcm_flag = false;
+                cyhal_pdm_pcm_read_async(&pdm_pcm, audio_frame, FRAME_SIZE);
+                cyhal_timer_reset(&imu_timer);
+                cyhal_timer_start(&imu_timer);
+                app_state = STATE_RECORDING;
+                printf("\r\nStarting new recording.\r\n");
+                return;
+            }
+            rc = cyhal_uart_getc(&cy_retarget_io_uart_obj, &ch, 20);
+        } while (rc != CY_RSLT_SUCCESS);
+
+        printf("%c\r\n", (char)ch);   /* echo + newline */
+
+        if (ch == 'd')
+        {
+            dump_csv();
+        }
+        else
+        {
+            printf("Unknown command. d=dump\r\n");
+        }
+    }
 }
 
 /* [] END OF FILE */
