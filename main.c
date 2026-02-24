@@ -116,7 +116,7 @@ void pdm_pcm_isr_handler(void *arg, cyhal_pdm_pcm_event_t event);
 void clock_init(void);
 void compute_psd(const int16_t *samples, float *psd_out);
 void display_psd(const float *psd);
-float find_peak_frequency(const float *psd, float *snr_out, float *peak_db_out);
+float find_peak_frequency(const float *psd, float *snr_out, float *peak_db_out, float min_freq_hz);
 void self_test(int16_t *buf, float *psd_buf, float test_freq);
 void imu_init(void);
 void imu_self_test(void);
@@ -302,7 +302,7 @@ int main(void)
 
                 compute_psd(audio_frame, psd);
                 float snr, peak_db;
-                float peak_freq = find_peak_frequency(psd, &snr, &peak_db);
+                float peak_freq = find_peak_frequency(psd, &snr, &peak_db, 800.0f);
 
                 /* Measure actual inter-frame interval using the DWT cycle counter.
                  * Unsigned subtraction is wrap-safe for intervals < 28.6 s. */
@@ -431,12 +431,17 @@ void pdm_pcm_isr_handler(void *arg, cyhal_pdm_pcm_event_t event)
 *  Estimated peak frequency in Hz.
 *
 *******************************************************************************/
-float find_peak_frequency(const float *psd, float *snr_out, float *peak_db_out)
+float find_peak_frequency(const float *psd, float *snr_out, float *peak_db_out, float min_freq_hz)
 {
-    /* Find the bin with maximum power, skipping DC */
-    uint32_t peak_bin = 1;
-    float peak_val = psd[1];
-    for (uint32_t k = 2; k < PSD_SIZE; k++)
+    /* Convert minimum frequency to a bin index, clamped to [1, PSD_SIZE-1] */
+    uint32_t start_bin = (uint32_t)(min_freq_hz * FRAME_SIZE / SAMPLE_RATE_HZ);
+    if (start_bin < 1) start_bin = 1;
+    if (start_bin >= PSD_SIZE) start_bin = PSD_SIZE - 1;
+
+    /* Find the bin with maximum power, starting from start_bin */
+    uint32_t peak_bin = start_bin;
+    float peak_val = psd[start_bin];
+    for (uint32_t k = start_bin + 1; k < PSD_SIZE; k++)
     {
         if (psd[k] > peak_val)
         {
@@ -745,7 +750,7 @@ void self_test(int16_t *buf, float *psd_buf, float test_freq)
 
     compute_psd(buf, psd_buf);
     float snr, peak_db;
-    float measured = find_peak_frequency(psd_buf, &snr, &peak_db);
+    float measured = find_peak_frequency(psd_buf, &snr, &peak_db, 800.0f);
 
     printf("Self-test: generated %.1f Hz, measured %.1f Hz, error %.2f Hz, SNR %.1f dB, Power %.1f dB\r\n",
         test_freq, measured, measured - test_freq, snr, peak_db);
