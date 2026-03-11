@@ -973,7 +973,6 @@ void dump_csv(void)
                r->power_x10 / 10.0f,
                ax, ay, az);
     }
-    printf("# %lu records\r\n", (unsigned long)record_count);
 }
 
 /*******************************************************************************
@@ -999,9 +998,6 @@ void run_cmd_mode(void)
 
     for (;;)
     {
-        printf("> ");
-        fflush(stdout);
-
         /* Poll for a UART byte using a short timeout so we can also respond
          * to a button press without blocking indefinitely.
          * cyhal_uart_getc with timeout > 0 returns an error code after that
@@ -1031,15 +1027,16 @@ void run_cmd_mode(void)
             rc = cyhal_uart_getc(&cy_retarget_io_uart_obj, &ch, 20);
         } while (rc != CY_RSLT_SUCCESS);
 
-        printf("%c\r\n", (char)ch);   /* echo + newline */
-
         if (ch == 'd')
         {
-            dump_csv();
+            dump_csv();   /* CSV flows directly; no echo, no trailing prompt */
         }
         else
         {
+            printf("%c\r\n", (char)ch);   /* echo + newline */
             printf("Unknown command. d=dump\r\n");
+            printf("> ");
+            fflush(stdout);
         }
     }
 }
